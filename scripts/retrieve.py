@@ -18,6 +18,7 @@ import json
 import os
 import pathlib
 import sys
+import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import memstore as ms
@@ -150,4 +151,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log = pathlib.Path.home() / ".claude" / "memory-hook.log"
+        with open(log, "a", encoding="utf-8") as f:
+            import datetime
+            f.write(f"\n[{datetime.datetime.now().isoformat()}] retrieve.py\n")
+            traceback.print_exc(file=f)
+        sys.exit(1)
