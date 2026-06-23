@@ -191,7 +191,7 @@ def collect() -> tuple[dict[pathlib.Path, list[Fact]], list[Fact], list[str]]:
     gmem = cdir / "memory"
     if gmem.is_dir():
         for md in sorted(gmem.rglob("*.md")):
-            if md.name == "MEMORY.md":
+            if md.name in ("MEMORY.md", "memory.active.md"):
                 continue
             got = parse_memory_file(md)
             if got:
@@ -205,7 +205,7 @@ def collect() -> tuple[dict[pathlib.Path, list[Fact]], list[Fact], list[str]]:
             if not mdir.is_dir():
                 continue
             for md in sorted(mdir.rglob("*.md")):
-                if md.name == "MEMORY.md":
+                if md.name in ("MEMORY.md", "memory.active.md"):
                     continue
                 got = parse_memory_file(md)
                 if not got:
