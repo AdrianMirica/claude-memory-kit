@@ -55,7 +55,17 @@ def render_claude_md(cfg: pathlib.Path) -> None:
     """Create CLAUDE.md if missing, else append our managed block. Idempotent:
     re-running replaces only the marked block and never touches user content."""
     rendered = TEMPLATE.read_text(encoding="utf-8")
-    rendered = rendered.replace("{{PYTHON}}", sys.executable).replace("{{MEMORY}}", str(MEMORY))
+    if sys.platform == "win32":
+        code_fence = "powershell"
+        python_cmd = f'& "{sys.executable}"'
+    else:
+        code_fence = "bash"
+        python_cmd = sys.executable
+    rendered = (rendered
+                .replace("{{CODE_FENCE}}", code_fence)
+                .replace("{{PYTHON_CMD}}", python_cmd)
+                .replace("{{PYTHON}}", sys.executable)
+                .replace("{{MEMORY}}", str(MEMORY)))
     block = f"{BLOCK_BEGIN}\n{rendered.rstrip()}\n{BLOCK_END}\n"
 
     target = cfg / "CLAUDE.md"
