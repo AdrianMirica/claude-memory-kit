@@ -101,7 +101,13 @@ def main() -> None:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         return
-    prompt = (payload.get("prompt") or "").strip()
+    prompt_raw = payload.get("prompt") or ""
+    if isinstance(prompt_raw, list):
+        prompt = " ".join(
+            c.get("text", "") for c in prompt_raw if isinstance(c, dict) and c.get("type") == "text"
+        ).strip()
+    else:
+        prompt = str(prompt_raw).strip()
     cwd = payload.get("cwd") or os.getcwd()
     if not prompt:
         return
