@@ -27,9 +27,11 @@ import subprocess
 import sys
 
 KIT = pathlib.Path(__file__).resolve().parent
-MEMORY = KIT / "scripts" / "memory.py"
-EXTRACT = KIT / "scripts" / "extract.py"
-RETRIEVE = KIT / "scripts" / "retrieve.py"
+SCRIPTS = KIT / "scripts"
+MEMORY = SCRIPTS / "memory.py"
+EXTRACT = SCRIPTS / "extract.py"
+RETRIEVE = SCRIPTS / "retrieve.py"
+IMPORT_NATIVE = SCRIPTS / "import_native.py"
 TEMPLATE = KIT / "templates" / "CLAUDE.global.md"
 
 # Engines for the SessionEnd extractor. Drop "llm" for zero extra Claude calls.
@@ -118,6 +120,47 @@ def initial_build(cfg: pathlib.Path) -> None:
     subprocess.run([sys.executable, str(MEMORY), "--global", "build"], env=env, check=False)
 
 
+def count_native_memories(cfg: pathlib.Path) -> int:
+    """Count importable Claude Code native memory-tool facts under <cfg>, or 0."""
+    sys.path.insert(0, str(SCRIPTS))
+    os.environ["CLAUDE_HOME"] = str(cfg)  # make claude_config_dir() resolve to cfg
+    try:
+        import import_native as seed
+    except Exception:
+        return 0
+    try:
+        repo_facts, global_facts, _ = seed.collect()
+    except Exception:
+        return 0
+    return len(global_facts) + sum(len(v) for v in repo_facts.values())
+
+
+def maybe_seed(cfg: pathlib.Path) -> None:
+    """If native memories exist, ask the user whether to import them into the store."""
+    total = count_native_memories(cfg)
+    if total == 0:
+        return
+    if not sys.stdin.isatty():            # non-interactive install -> never block
+        print(f"Found {total} existing memories; run 'python scripts/import_native.py "
+              f"--apply' to import them.")
+        return
+    while True:
+        try:
+            ans = input(f"You have {total} existing memories - do you want them imported? "
+                        f"yes(y) or no(n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nskipped import")
+            return
+        if ans in ("y", "yes"):
+            subprocess.run([sys.executable, str(IMPORT_NATIVE), "--apply"],
+                           env={**os.environ, "CLAUDE_HOME": str(cfg)}, check=False)
+            return
+        if ans in ("n", "no"):
+            print("skipped import")
+            return
+        print("please answer y/yes or n/no.")
+
+
 def main() -> None:
     if not TEMPLATE.exists():
         sys.exit(f"template missing: {TEMPLATE}")
@@ -126,6 +169,7 @@ def main() -> None:
     print(f"Python:            {sys.executable}")
     render_claude_md(cfg)
     merge_settings(cfg)
+    maybe_seed(cfg)
     initial_build(cfg)
     print("\nDone. Restart Claude Code; capture runs automatically from now on.")
     print("To disable the extra Claude call, edit settings.json SessionEnd args -> [\"<extract.py>\", \"regex\"].")

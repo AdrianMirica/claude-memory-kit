@@ -1,0 +1,38 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+scripts/__pycache__/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated memory stores/caches (runtime state, not source)
+memory.store.json
+memory.active.md
+memory.vectors.json
+.claude/memory.store.json
+.claude/memory.active.md
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
