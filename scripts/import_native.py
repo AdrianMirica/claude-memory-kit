@@ -16,6 +16,8 @@ Scope mapping
   ~/.claude/memory/**            -> user (global ~/.claude store)
   ~/.claude/projects/<enc>/memory/** -> repo, IF the encoded path resolves to a
        local git repo; otherwise skipped (or --unresolved global to keep them).
+  metadata.type: user|feedback   -> always global, regardless of folder
+  metadata.type: project|reference -> folder-based routing (repo if resolvable)
 
 Safe by default: prints a preview and writes nothing unless you pass --apply.
 
@@ -38,8 +40,14 @@ import memory as mem  # reused as a library (its main() is __main__-guarded)
 import memstore as ms
 
 MAX_FACT_LEN = 200          # match the kit's convention (extract.py truncates to 200)
+MAX_QUOTE_LEN = 400         # quote is body provenance; indexed by BM25 but not displayed
 MIN_FACT_LEN = 12           # drop trivially short fragments
 _KV_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*:\s*(.*)$")
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_LINK_RE = re.compile(r"\[\[.*?\]\]")
+
+# metadata.type values that belong in global store regardless of which folder they came from
+_GLOBAL_TYPES = {"user", "feedback"}
 
 
 def claude_dir() -> pathlib.Path:
@@ -88,14 +96,32 @@ def _unquote(v: str) -> str:
     return v.strip()
 
 
-def parse_memory_file(md: pathlib.Path) -> tuple[str, str] | None:
+def _clean_body(body: str) -> str:
+    """Strip markdown decoration from body lines, skip pure link lines, join."""
+    lines = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if _LINK_RE.fullmatch(line):         # skip [[memory-link]] lines entirely
+            continue
+        line = _BOLD_RE.sub(r"\1", line)     # **Why:** -> Why:
+        line = _LINK_RE.sub("", line).strip()
+        if line:
+            lines.append(line)
+    return " ".join(lines)
+
+
+def parse_memory_file(md: pathlib.Path) -> tuple[str, str, str, str] | None:
     """Parse one native memory file (YAML-frontmatter + rationale body).
 
-    Each file is a single memory. The `description` field is the durable, concise
-    fact we store; the body is rationale we keep only as short provenance. Falls
-    back to `name` (humanized) or the first body paragraph if description is absent.
+    Returns (fact, origin_name, mem_type, body_quote) or None.
 
-    Returns (fact, origin_name) or None.
+    - fact      : description field (or fallback to first body paragraph / name)
+    - origin_name: name field or stem, used as provenance label
+    - mem_type  : value of metadata.type (e.g. 'user', 'feedback', 'project',
+                  'reference'); empty string if absent
+    - body_quote: cleaned body text for BM25 indexing (Why/How to apply content)
     """
     try:
         raw = md.read_text(encoding="utf-8", errors="replace")
@@ -107,7 +133,7 @@ def parse_memory_file(md: pathlib.Path) -> tuple[str, str] | None:
     while lines and (not lines[0].strip() or lines[0].strip().lower() in ("yaml", "```yaml", "```", "---")):
         lines.pop(0)
 
-    name = desc = ""
+    name = desc = mem_type = ""
     body_start = 0
     for i, line in enumerate(lines):
         if line.strip() == "---":            # end of an explicit frontmatter block
@@ -120,6 +146,8 @@ def parse_memory_file(md: pathlib.Path) -> tuple[str, str] | None:
                 name = _unquote(val)
             elif key == "description" and not desc:
                 desc = _unquote(val)
+            elif key == "type" and not mem_type:
+                mem_type = _unquote(val).lower()
             body_start = i + 1
             continue
         if line.strip() == "":               # blank line ends the header region
@@ -128,34 +156,46 @@ def parse_memory_file(md: pathlib.Path) -> tuple[str, str] | None:
         body_start = i                        # first real prose line -> body begins
         break
 
+    body_text = "\n".join(lines[body_start:]).strip()
+    body_quote = _clean_body(body_text)
+
     fact = desc.strip()
     if len(fact) < MIN_FACT_LEN:
-        body = "\n".join(lines[body_start:]).strip()
         para = next((re.sub(r"\s+", " ", p).strip()
-                     for p in re.split(r"\n\s*\n", body) if p.strip()), "")
+                     for p in re.split(r"\n\s*\n", body_text) if p.strip()), "")
         fact = para or name.replace("-", " ").strip()
     if len(fact) < MIN_FACT_LEN:
         return None
-    return fact[:MAX_FACT_LEN], (name or md.stem)
+    return fact[:MAX_FACT_LEN], (name or md.stem), mem_type, body_quote[:MAX_QUOTE_LEN]
 
 
-def collect() -> tuple[dict[pathlib.Path, list[tuple[str, str]]], list[tuple[str, str]], list[str]]:
+# Fact tuples: (fact_text, source_relpath, quote_text)
+Fact = tuple[str, str, str]
+
+
+def collect() -> tuple[dict[pathlib.Path, list[Fact]], list[Fact], list[str]]:
     """Returns (repo_facts_by_root, global_facts, unresolved_project_names).
 
-    Each fact is (fact_text, source_relpath_for_provenance).
+    Routing:
+      - metadata.type user|feedback  -> global, regardless of folder
+      - global memory dir            -> global
+      - project dir with resolved repo -> repo
+      - project dir, unresolved      -> unresolved list (opt --unresolved global)
     """
     cdir = claude_dir()
-    repo_facts: dict[pathlib.Path, list[tuple[str, str]]] = {}
-    global_facts: list[tuple[str, str]] = []
+    repo_facts: dict[pathlib.Path, list[Fact]] = {}
+    global_facts: list[Fact] = []
     unresolved: list[str] = []
 
     # Global/user native notes: ~/.claude/memory/**
     gmem = cdir / "memory"
     if gmem.is_dir():
         for md in sorted(gmem.rglob("*.md")):
+            if md.name == "MEMORY.md":
+                continue
             got = parse_memory_file(md)
             if got:
-                global_facts.append((got[0], str(md.relative_to(cdir))))
+                global_facts.append((got[0], str(md.relative_to(cdir)), got[3]))
 
     # Project-scoped native notes: ~/.claude/projects/<enc>/memory/**
     projects = cdir / "projects"
@@ -164,20 +204,28 @@ def collect() -> tuple[dict[pathlib.Path, list[tuple[str, str]]], list[tuple[str
             mdir = proj / "memory"
             if not mdir.is_dir():
                 continue
-            facts: list[tuple[str, str]] = []
             for md in sorted(mdir.rglob("*.md")):
+                if md.name == "MEMORY.md":
+                    continue
                 got = parse_memory_file(md)
-                if got:
-                    facts.append((got[0], str(md.relative_to(proj))))
-            if not facts:
-                continue
-            root = decode_project_dir(proj.name)
-            if root and is_git_repo(root):
-                repo_facts.setdefault(root, []).extend(facts)
-            else:
-                unresolved.append(proj.name)
-                # stash for optional --unresolved global handling
-                repo_facts.setdefault(None, []).extend(facts)  # type: ignore[arg-type]
+                if not got:
+                    continue
+                fact, _name, mem_type, quote = got
+                entry: Fact = (fact, str(md.relative_to(proj)), quote)
+
+                # Type-based override: user/feedback facts belong in global store
+                if mem_type in _GLOBAL_TYPES:
+                    global_facts.append(entry)
+                    continue
+
+                # Folder-based routing for project/reference/untyped
+                root = decode_project_dir(proj.name)
+                if root and is_git_repo(root):
+                    repo_facts.setdefault(root, []).append(entry)
+                else:
+                    unresolved.append(proj.name)
+                    repo_facts.setdefault(None, []).append(entry)  # type: ignore[arg-type]
+
     return repo_facts, global_facts, unresolved
 
 
@@ -194,13 +242,13 @@ def _target_repo(root: pathlib.Path) -> None:
     mem.ACTIVE = base / "memory.active.md"
 
 
-def add_facts(scope: str, facts: list[tuple[str, str]]) -> tuple[int, int]:
+def add_facts(scope: str, facts: list[Fact]) -> tuple[int, int]:
     """Append facts to the currently-targeted store (dedupe in-memory), then
     rebuild the active file once. Returns (added, deduped)."""
     data = mem.load()
     index = {e["fact"].strip().lower(): e for e in data["entries"]}
     added = deduped = 0
-    for fact, source in facts:
+    for fact, source, quote in facts:
         key = fact.strip().lower()
         hit = index.get(key)
         if hit:
@@ -218,7 +266,8 @@ def add_facts(scope: str, facts: list[tuple[str, str]]) -> tuple[int, int]:
             "last_validated": mem.today(),
             "access_count": 0,
             "status": "active",
-            "source": source,           # provenance; ignored by BM25/embedding ranking
+            "source": source,
+            "quote": quote,              # body content; indexed by BM25 in retrieve.py
         }
         data["entries"].append(entry)
         index[key] = entry
@@ -239,7 +288,7 @@ def main() -> None:
     args = ap.parse_args()
 
     repo_facts, global_facts, unresolved = collect()
-    stray = repo_facts.pop(None, [])  # type: ignore[arg-type]
+    stray: list[Fact] = repo_facts.pop(None, [])  # type: ignore[arg-type]
     if args.unresolved == "global":
         global_facts.extend(stray)
 
