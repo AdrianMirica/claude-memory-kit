@@ -95,6 +95,7 @@ def candidates(cwd: str) -> list[tuple[dict, str, pathlib.Path]]:
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
     # Don't run inside the headless extraction call.
     if os.environ.get("MEMORY_HOOK") == "1":
         return

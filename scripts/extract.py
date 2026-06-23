@@ -158,6 +158,7 @@ def in_git_repo(cwd: str) -> bool:
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
     # Recursion guard: if invoked from within an llm extraction call, do nothing.
     if os.environ.get("MEMORY_HOOK") == "1":
         return

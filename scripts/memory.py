@@ -326,6 +326,7 @@ def cmd_gc(_: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--global", dest="is_global", action="store_true",
                    help="operate on the cross-session global store (~/.claude) instead of the repo store")
