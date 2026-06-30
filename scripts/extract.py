@@ -25,12 +25,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 MEMORY = HERE / "memory.py"
 # The detached worker has no console (stdout/stderr go to DEVNULL), so this file
 # is the only window into what it did. Lives next to the global store.
 LOG_FILE = pathlib.Path.home() / ".claude" / "memory-extract.log"
+
+# Recursion guard. The llm engine runs `claude -p`, which is itself a Claude
+# session whose SessionEnd fires this hook again -> fork bomb. The MEMORY_HOOK
+# env var alone is not enough: Claude Code does not reliably forward it into the
+# hook it spawns for the headless session. This on-disk lock does not depend on
+# env propagation -- the worker holds it across the `claude -p` call, so any
+# nested extraction sees it and bails. TTL guards against a stale lock left by a
+# hard-killed worker (must exceed the llm engine's 120s timeout).
+LOCK_FILE = pathlib.Path.home() / ".claude" / "memory-extract.lock"
+LOCK_TTL = 600  # seconds
 
 
 def log(msg: str) -> None:
@@ -45,6 +56,31 @@ def log(msg: str) -> None:
     except OSError:
         pass
     print(msg)
+
+
+def lock_is_active() -> bool:
+    """True if a fresh extraction lock exists (another run holds it). A lock
+    older than LOCK_TTL is treated as stale leftover and ignored."""
+    try:
+        age = time.time() - LOCK_FILE.stat().st_mtime
+    except OSError:
+        return False
+    return age < LOCK_TTL
+
+
+def acquire_lock() -> None:
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def release_lock() -> None:
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 # Explicit-preference triggers for the cheap engine (user-scope / global).
 TRIGGERS = re.compile(
@@ -213,8 +249,11 @@ FAST_ENGINES = {"regex"}
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
-    # Recursion guard: if invoked from within an llm extraction call, do nothing.
-    if os.environ.get("MEMORY_HOOK") == "1":
+    # Recursion guard. Two independent checks so a fork bomb can't slip through:
+    #   1. MEMORY_HOOK env var  - cheap, catches direct children when forwarded
+    #   2. on-disk lock          - robust, works even if the env var is stripped
+    if os.environ.get("MEMORY_HOOK") == "1" or lock_is_active():
+        log("[memory] skip: nested or locked invocation")
         return
 
     argv = sys.argv[1:]
@@ -265,7 +304,13 @@ def main() -> None:
     if "regex" in run_here:
         total += engine_regex(turns, cwd)
     if "llm" in run_here:
-        total += engine_llm(turns, cwd)
+        # Hold the lock across the `claude -p` call. The headless session's own
+        # SessionEnd fires this hook again; it sees the lock and bails.
+        acquire_lock()
+        try:
+            total += engine_llm(turns, cwd)
+        finally:
+            release_lock()
     log(f"[memory] {where} captured {total} fact(s) from session")
 
 
