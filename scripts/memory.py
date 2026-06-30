@@ -52,7 +52,7 @@ def git_root() -> pathlib.Path:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
         )
         return pathlib.Path(out.stdout.strip())
     except (subprocess.CalledProcessError, FileNotFoundError):

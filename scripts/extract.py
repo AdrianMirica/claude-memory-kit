@@ -153,7 +153,7 @@ def store(fact: str, scope: str, evidence: str, cwd: str) -> None:
     env = {**os.environ, "MEMORY_HOOK": "1"}  # guard nested invocations
     try:
         subprocess.run(cmd, cwd=run_cwd, env=env, capture_output=True, text=True,
-                       timeout=30, creationflags=NO_WINDOW)
+                       encoding="utf-8", errors="replace", timeout=30, creationflags=NO_WINDOW)
     except (subprocess.SubprocessError, OSError) as e:
         log(f"[memory] store failed: {e}")
 
@@ -181,8 +181,8 @@ def engine_llm(turns: list[tuple[str, str]], cwd: str) -> int:
     try:
         res = subprocess.run(
             [claude, "-p", LLM_PROMPT + convo],
-            env=env, capture_output=True, text=True, timeout=120,
-            creationflags=NO_WINDOW,
+            env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, creationflags=NO_WINDOW,
         )
     except (subprocess.SubprocessError, OSError) as e:
         log(f"[memory] llm engine failed: {e}")
@@ -245,7 +245,8 @@ def spawn_detached(payload: dict, engines: list[str]) -> None:
 def in_git_repo(cwd: str) -> bool:
     try:
         r = subprocess.run(["git", "-C", cwd or ".", "rev-parse", "--is-inside-work-tree"],
-                           capture_output=True, text=True, creationflags=NO_WINDOW)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=NO_WINDOW)
         return r.stdout.strip() == "true"
     except (OSError, subprocess.SubprocessError):
         return False
