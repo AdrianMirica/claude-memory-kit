@@ -43,6 +43,12 @@ LOG_FILE = pathlib.Path.home() / ".claude" / "memory-extract.log"
 LOCK_FILE = pathlib.Path.home() / ".claude" / "memory-extract.lock"
 LOCK_TTL = 600  # seconds
 
+# Windows console-window suppression. The detached worker runs `claude -p`, which
+# spawns its own tree of console subprocesses (node, ripgrep, its hooks). Without
+# a console to inherit, each would pop a brief window. CREATE_NO_WINDOW gives the
+# worker a hidden console its whole child tree inherits. 0 (no-op) on POSIX.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 
 def log(msg: str) -> None:
     """Append a timestamped, pid-tagged line to LOG_FILE and echo to stdout.
@@ -146,7 +152,8 @@ def store(fact: str, scope: str, evidence: str, cwd: str) -> None:
     cmd += ["add", fact[:200], "--scope", scope, "--quote", evidence[:200]]
     env = {**os.environ, "MEMORY_HOOK": "1"}  # guard nested invocations
     try:
-        subprocess.run(cmd, cwd=run_cwd, env=env, capture_output=True, text=True, timeout=30)
+        subprocess.run(cmd, cwd=run_cwd, env=env, capture_output=True, text=True,
+                       timeout=30, creationflags=NO_WINDOW)
     except (subprocess.SubprocessError, OSError) as e:
         log(f"[memory] store failed: {e}")
 
@@ -175,6 +182,7 @@ def engine_llm(turns: list[tuple[str, str]], cwd: str) -> int:
         res = subprocess.run(
             [claude, "-p", LLM_PROMPT + convo],
             env=env, capture_output=True, text=True, timeout=120,
+            creationflags=NO_WINDOW,
         )
     except (subprocess.SubprocessError, OSError) as e:
         log(f"[memory] llm engine failed: {e}")
@@ -217,9 +225,10 @@ def spawn_detached(payload: dict, engines: list[str]) -> None:
     # need different knobs; everything else (cmd, DEVNULL pipes) is shared.
     kwargs: dict = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.name == "nt":
-        # Windows: no parent console, own process group. getattr falls back to the
-        # documented flag values if the constants are ever missing.
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        # Windows: hidden console (not DETACHED_PROCESS) so the whole claude -p
+        # child tree inherits it and no console windows flash; own process group
+        # so the closing session's Ctrl-signals don't reach it.
+        flags = NO_WINDOW or getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         kwargs["creationflags"] = flags
     else:
@@ -236,7 +245,7 @@ def spawn_detached(payload: dict, engines: list[str]) -> None:
 def in_git_repo(cwd: str) -> bool:
     try:
         r = subprocess.run(["git", "-C", cwd or ".", "rev-parse", "--is-inside-work-tree"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, creationflags=NO_WINDOW)
         return r.stdout.strip() == "true"
     except (OSError, subprocess.SubprocessError):
         return False
