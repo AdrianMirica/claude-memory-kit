@@ -36,3 +36,6 @@ memory.vectors.json
 *.swp
 .DS_Store
 Thumbs.db
+
+# AI Development Tools
+.serena/

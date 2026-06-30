@@ -16,6 +16,7 @@ headless call's own SessionEnd from re-triggering extraction forever.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -23,9 +24,27 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 MEMORY = HERE / "memory.py"
+# The detached worker has no console (stdout/stderr go to DEVNULL), so this file
+# is the only window into what it did. Lives next to the global store.
+LOG_FILE = pathlib.Path.home() / ".claude" / "memory-extract.log"
+
+
+def log(msg: str) -> None:
+    """Append a timestamped, pid-tagged line to LOG_FILE and echo to stdout.
+    Stdout is visible only in the foreground hook; the file works everywhere."""
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] [pid {os.getpid()}] {msg}"
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(msg)
 
 # Explicit-preference triggers for the cheap engine (user-scope / global).
 TRIGGERS = re.compile(
@@ -93,7 +112,7 @@ def store(fact: str, scope: str, evidence: str, cwd: str) -> None:
     try:
         subprocess.run(cmd, cwd=run_cwd, env=env, capture_output=True, text=True, timeout=30)
     except (subprocess.SubprocessError, OSError) as e:
-        print(f"[memory] store failed: {e}", file=sys.stderr)
+        log(f"[memory] store failed: {e}")
 
 
 def engine_regex(turns: list[tuple[str, str]], cwd: str) -> int:
@@ -112,7 +131,7 @@ def engine_regex(turns: list[tuple[str, str]], cwd: str) -> int:
 def engine_llm(turns: list[tuple[str, str]], cwd: str) -> int:
     claude = shutil.which("claude")
     if not claude:
-        print("[memory] claude CLI not found; skipping llm engine", file=sys.stderr)
+        log("[memory] claude CLI not found; skipping llm engine")
         return 0
     convo = "\n".join(f"{r.upper()}: {t}" for r, t in turns)[:60000]
     env = {**os.environ, "MEMORY_HOOK": "1"}  # prevents the headless call's hook from recursing
@@ -122,7 +141,7 @@ def engine_llm(turns: list[tuple[str, str]], cwd: str) -> int:
             env=env, capture_output=True, text=True, timeout=120,
         )
     except (subprocess.SubprocessError, OSError) as e:
-        print(f"[memory] llm engine failed: {e}", file=sys.stderr)
+        log(f"[memory] llm engine failed: {e}")
         return 0
     facts = parse_json_array(res.stdout)
     n = 0
@@ -148,6 +167,36 @@ def parse_json_array(text: str) -> list[dict]:
         return []
 
 
+def spawn_detached(payload: dict, engines: list[str]) -> None:
+    """Fork a background copy of this script to run slow engines after the hook
+    returns. SessionEnd won't wait on it, so the session closes immediately and
+    the `claude -p` llm call is never cancelled mid-flight."""
+    tf = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="memextract-", delete=False, encoding="utf-8"
+    )
+    json.dump(payload, tf)
+    tf.close()
+    cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), "--from-file", tf.name, *engines]
+    # Cut the child loose so it survives the hook exiting. The two OS families
+    # need different knobs; everything else (cmd, DEVNULL pipes) is shared.
+    kwargs: dict = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.name == "nt":
+        # Windows: no parent console, own process group. getattr falls back to the
+        # documented flag values if the constants are ever missing.
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        kwargs["creationflags"] = flags
+    else:
+        # POSIX (Linux/macOS): new session so it's not killed with the parent group.
+        kwargs["start_new_session"] = True
+    try:
+        child = subprocess.Popen(cmd, **kwargs)
+        log(f"[memory] detached worker pid {child.pid} for engines {engines}")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        log(f"[memory] detach failed, skipping background engines: {e}")
+        pathlib.Path(tf.name).unlink(missing_ok=True)
+
+
 def in_git_repo(cwd: str) -> bool:
     try:
         r = subprocess.run(["git", "-C", cwd or ".", "rev-parse", "--is-inside-work-tree"],
@@ -157,17 +206,44 @@ def in_git_repo(cwd: str) -> bool:
         return False
 
 
+# Engines safe to run synchronously inside the hook (sub-second). Anything not
+# listed is forked to a detached worker so SessionEnd never blocks on it.
+FAST_ENGINES = {"regex"}
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     # Recursion guard: if invoked from within an llm extraction call, do nothing.
     if os.environ.get("MEMORY_HOOK") == "1":
         return
 
-    engines = sys.argv[1:] or ["regex", "llm"]  # default: both
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
-        payload = {}
+    argv = sys.argv[1:]
+
+    # Detached-worker mode: payload comes from a temp file, every engine runs
+    # inline (we're already backgrounded, so blocking is fine).
+    detached = False
+    payload_file = None
+    if argv and argv[0] == "--from-file":
+        detached = True
+        payload_file = argv[1]
+        argv = argv[2:]
+
+    engines = argv or ["regex", "llm"]
+
+    if detached:
+        try:
+            payload = json.loads(pathlib.Path(payload_file).read_text(encoding="utf-8") or "{}")
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        finally:
+            if payload_file:
+                pathlib.Path(payload_file).unlink(missing_ok=True)
+    else:
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+
     transcript = payload.get("transcript_path", "")
     cwd = payload.get("cwd", os.getcwd())
     if not transcript:
@@ -177,12 +253,20 @@ def main() -> None:
     if not turns:
         return
 
+    slow = [e for e in engines if e not in FAST_ENGINES]
+    if not detached and slow:
+        spawn_detached(payload, slow)  # hand off llm etc. to the background
+
+    where = "detached worker" if detached else "hook"
+    run_here = engines if detached else [e for e in engines if e in FAST_ENGINES]
+    log(f"[memory] {where} starting engines {run_here} over {len(turns)} turn(s)")
+
     total = 0
-    if "regex" in engines:
+    if "regex" in run_here:
         total += engine_regex(turns, cwd)
-    if "llm" in engines:
+    if "llm" in run_here:
         total += engine_llm(turns, cwd)
-    print(f"[memory] captured {total} fact(s) from session")
+    log(f"[memory] {where} captured {total} fact(s) from session")
 
 
 if __name__ == "__main__":
